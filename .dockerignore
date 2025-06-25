@@ -1,0 +1,34 @@
+# Minimal .dockerignore - only exclude what we really don't need
+
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+
+# Virtual environments  
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker files (don't need these inside the container)
+Dockerfile*
+docker-compose*.yml
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
