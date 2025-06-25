@@ -1,0 +1,367 @@
+# .gitignore for Multi-Model AI Comparison Tool
+
+# =============================================================================
+# Environment Variables & Secrets
+# =============================================================================
+.env
+.env.local
+.env.production
+.env.development
+.env.*.local
+
+# API Keys and sensitive configuration
+secrets/
+*.key
+*.pem
+ssl/
+
+# =============================================================================
+# Python
+# =============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# =============================================================================
+# IDEs and Editors
+# =============================================================================
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# =============================================================================
+# Operating System
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+
+# =============================================================================
+# Docker
+# =============================================================================
+# Don't ignore Dockerfiles, but ignore runtime files
+docker-compose.override.yml
+.dockerignore
+
+# =============================================================================
+# Application Specific
+# =============================================================================
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# Test results
+test_results.json
+test_results.yaml
+test-results/
+.coverage
+
+# Backup files
+backups/
+*.backup
+*.bak
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Monitoring and metrics
+prometheus-data/
+grafana-data/
+
+# SSL certificates (should be generated, not committed)
+ssl/
+certs/
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx
+
+# =============================================================================
+# Development and Build
+# =============================================================================
+# Node modules (if you add any frontend tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist/
+build/
+
+# Package files
+*.tar.gz
+*.zip
+
+# =============================================================================
+# Streamlit Specific
+# =============================================================================
+.streamlit/
+.streamlit/secrets.toml
+
+# =============================================================================
+# Jupyter Notebooks (if you add any)
+# =============================================================================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# =============================================================================
+# Documentation
+# =============================================================================
+# Generated documentation
+docs/_build/
+docs/build/
+site/
+
+# =============================================================================
+# Cloud and Deployment
+# =============================================================================
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# AWS
+.aws/
+
+# Google Cloud
+.gcloud/
+service-account.json
+gcp-key.json
+
+# Azure
+.azure/
+
+# =============================================================================
+# Monitoring and Observability
+# =============================================================================
+# Prometheus data
+prometheus_data/
+
+# Grafana data
+grafana_data/
+
+# Application metrics
+metrics/
+*.metrics
+
+# =============================================================================
+# Custom Application Files
+# =============================================================================
+# Export files from the application
+export_*.json
+export_*.yaml
+ai_comparison_*.json
+
+# System reports
+system_report.md
+performance_report.html
+
+# API response cache
+.cache/
+cache/
+
+# Development database
+dev.db
+development.sqlite
+
+# Production secrets (should never be committed)
+production.env
+prod.env
+.env.prod
+.env.production
+
+# Local development overrides
+local_settings.py
+local_config.json
+
+# =============================================================================
+# CI/CD
+# =============================================================================
+# GitHub Actions
+.github/workflows/*.yml
+!.github/workflows/ci.yml
+!.github/workflows/deploy.yml
+
+# GitLab CI
+.gitlab-ci.yml
+
+# Jenkins
+Jenkinsfile.local
+
+# =============================================================================
+# Security
+# =============================================================================
+# Private keys
+private_key
+*.pem
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# OAuth tokens
+.oauth
+oauth.json
+
+# Session files
+.sessions/
+session_*
+
+# =============================================================================
+# Optional: Keep certain template/example files
+# =============================================================================
+# These should be committed as templates
+!.env.example
+!.env.template
+!docker-compose.example.yml
+!config.example.json

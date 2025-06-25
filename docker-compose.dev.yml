@@ -1,0 +1,28 @@
+# docker-compose.dev.yml - Development environment
+version: '3.8'
+
+services:
+  multi-model-ai-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8501:8501"
+    environment:
+      - DEBUG_MODE=true
+      - LOG_LEVEL=DEBUG
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    command: >
+      sh -c "pip install -e . && 
+             streamlit run app.py --server.port=8501 --server.address=0.0.0.0 
+             --server.headless=true --server.fileWatcherType=auto 
+             --browser.gatherUsageStats=false"
+    networks:
+      - ai-comparison-network
+
+networks:
+  ai-comparison-network:
+    driver: bridge

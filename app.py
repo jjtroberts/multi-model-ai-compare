@@ -2,15 +2,20 @@ import asyncio
 import aiohttp
 import streamlit as st
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import json
 import time
 import os
 from datetime import datetime
 import logging
+import traceback
+import re
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Load API keys from environment variables
@@ -23,12 +28,149 @@ def load_env_api_keys():
     }
 
 @dataclass
+class DetailedError:
+    """Enhanced error reporting structure"""
+    error_type: str
+    error_message: str
+    http_status: Optional[int] = None
+    response_headers: Optional[Dict] = None
+    request_url: Optional[str] = None
+    request_payload: Optional[Dict] = None
+    raw_response: Optional[str] = None
+    troubleshooting_tips: List[str] = None
+    timestamp: str = ""
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now().isoformat()
+        if not self.troubleshooting_tips:
+            self.troubleshooting_tips = []
+
+@dataclass
 class ModelResponse:
     model_name: str
     response: str
     tokens_used: Optional[int] = None
     response_time: float = 0.0
     error: Optional[str] = None
+    detailed_error: Optional[DetailedError] = None
+
+class GeminiDebugger:
+    """Enhanced debugging and error reporting for Gemini API"""
+    
+    def __init__(self):
+        self.debug_mode = True
+        self.request_history = []
+    
+    def validate_api_key(self, api_key: str) -> tuple[bool, List[str]]:
+        """Validate Gemini API key format and provide troubleshooting tips"""
+        issues = []
+        
+        if not api_key:
+            issues.append("API key is empty")
+            return False, issues
+        
+        # Check basic format (Gemini keys typically start with specific patterns)
+        if not re.match(r'^[A-Za-z0-9_-]+$', api_key):
+            issues.append("API key contains invalid characters")
+        
+        if len(api_key) < 20:
+            issues.append("API key appears too short (typical keys are 39+ characters)")
+        
+        if len(api_key) > 100:
+            issues.append("API key appears too long")
+        
+        # Check for common mistakes
+        if api_key.startswith('sk-'):
+            issues.append("This appears to be an OpenAI key (starts with 'sk-'), not a Google API key")
+        
+        if api_key.startswith('claude-'):
+            issues.append("This appears to be a Claude key format, not a Google API key")
+        
+        return len(issues) == 0, issues
+    
+    def get_troubleshooting_tips(self, error_type: str, status_code: Optional[int] = None) -> List[str]:
+        """Get specific troubleshooting tips based on error type"""
+        tips = []
+        
+        if status_code == 400:
+            tips.extend([
+                "🔧 Check if the model name is correct and available",
+                "🔧 Verify the request payload format matches Gemini API specs",
+                "🔧 Ensure maxOutputTokens is within allowed range (1-8192)",
+                "🔧 Check if the prompt text contains unsupported characters"
+            ])
+        elif status_code == 401:
+            tips.extend([
+                "🔑 Verify your API key is correct and active",
+                "🔑 Check if the API key has proper permissions",
+                "🔑 Ensure you're using a Google AI Studio API key, not other Google service keys"
+            ])
+        elif status_code == 403:
+            tips.extend([
+                "🚫 Check if Gemini API is enabled in your Google Cloud project",
+                "🚫 Verify your account has access to the requested model",
+                "🚫 Check regional availability of the model",
+                "🚫 Ensure you're not exceeding quota limits"
+            ])
+        elif status_code == 404:
+            tips.extend([
+                "🔍 Verify the model name exists and is spelled correctly",
+                "🔍 Check if the model is available in your region",
+                "🔍 Try using a different model version (e.g., gemini-1.5-pro vs gemini-1.5-pro-latest)"
+            ])
+        elif status_code == 429:
+            tips.extend([
+                "⏱️ You're being rate limited - wait before retrying",
+                "⏱️ Consider upgrading your API plan for higher rate limits",
+                "⏱️ Implement exponential backoff in your requests"
+            ])
+        elif status_code == 500:
+            tips.extend([
+                "🔄 Google's servers are experiencing issues - try again later",
+                "🔄 Try a different model if available",
+                "🔄 Reduce the complexity or length of your prompt"
+            ])
+        elif error_type == "connection":
+            tips.extend([
+                "🌐 Check your internet connection",
+                "🌐 Verify firewall settings allow HTTPS to generativelanguage.googleapis.com",
+                "🌐 Try using a different DNS server"
+            ])
+        elif error_type == "timeout":
+            tips.extend([
+                "⏰ Request timed out - try reducing prompt length",
+                "⏰ Reduce maxOutputTokens to speed up response",
+                "⏰ Check your network stability"
+            ])
+        
+        # General tips for all errors
+        if not tips:
+            tips.extend([
+                "🔧 Check the Gemini API documentation: https://ai.google.dev/docs",
+                "🔧 Verify your API key at https://aistudio.google.com/app/apikey",
+                "🔧 Try a simple test request with curl to isolate the issue"
+            ])
+        
+        return tips
+    
+    def log_request_details(self, url: str, headers: Dict, payload: Dict, api_key: str):
+        """Log detailed request information for debugging"""
+        masked_key = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "***"
+        
+        logger.info(f"🚀 Gemini API Request:")
+        logger.info(f"   URL: {url}")
+        logger.info(f"   API Key: {masked_key}")
+        logger.info(f"   Payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"   Headers: {json.dumps({k: v for k, v in headers.items() if k.lower() != 'authorization'}, indent=2)}")
+    
+    def log_response_details(self, status: int, headers: Dict, response_text: str):
+        """Log detailed response information for debugging"""
+        logger.info(f"📥 Gemini API Response:")
+        logger.info(f"   Status: {status}")
+        logger.info(f"   Headers: {json.dumps(dict(headers), indent=2)}")
+        logger.info(f"   Response length: {len(response_text)} characters")
+        logger.info(f"   Response preview: {response_text[:500]}...")
 
 class ModelDiscovery:
     """Dynamically discover available models from API providers"""
@@ -100,12 +242,23 @@ class ModelDiscovery:
             return []
     
     async def get_gemini_models(self, api_key: str) -> List[Dict]:
-        """Fetch available Gemini models from Google API (free)"""
+        """Fetch available Gemini models from Google API (free) with enhanced debugging"""
+        debugger = GeminiDebugger()
+        
         try:
             url = f'https://generativelanguage.googleapis.com/v1beta/models?key={api_key}'
+            headers = {'User-Agent': 'Multi-Model-AI-Comparison/1.0'}
+            
+            # Log request details
+            debugger.log_request_details(url, headers, {}, api_key)
             
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
+                async with session.get(url, headers=headers) as response:
+                    response_text = await response.text()
+                    
+                    # Log response details
+                    debugger.log_response_details(response.status, response.headers, response_text)
+                    
                     if response.status == 200:
                         data = await response.json()
                         logger.info(f"Gemini models API response keys: {list(data.keys())}")
@@ -115,6 +268,7 @@ class ModelDiscovery:
                         
                         if not models_list:
                             logger.warning("No models found in Gemini API response")
+                            logger.info(f"Full response: {json.dumps(data, indent=2)}")
                             return []
                         
                         for model in models_list:
@@ -135,11 +289,11 @@ class ModelDiscovery:
                         logger.info(f"Found {len(models)} Gemini models")
                         return models
                     else:
-                        error_text = await response.text()
-                        logger.warning(f"Gemini models API returned {response.status}: {error_text}")
+                        logger.error(f"Gemini models API returned {response.status}: {response_text}")
                         return []
         except Exception as e:
-            logger.warning(f"Failed to fetch Gemini models: {e}")
+            logger.error(f"Failed to fetch Gemini models: {e}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
             return []
     
     def get_fallback_models(self, provider: str) -> Dict[str, str]:
@@ -170,6 +324,7 @@ class ModelDiscovery:
 class MultiModelAgent:
     def __init__(self):
         self.discovery = ModelDiscovery()
+        self.gemini_debugger = GeminiDebugger()
         # Simplified API configurations (URLs and headers only)
         self.apis = {
             'claude': {
@@ -336,53 +491,225 @@ class MultiModelAgent:
             )
     
     async def query_gemini(self, prompt: str, api_key: str, model: str, max_tokens: int = 2000) -> ModelResponse:
+        """Enhanced Gemini query with detailed error reporting"""
         start_time = time.time()
+        debugger = self.gemini_debugger
+        
         try:
-            # Update URL to use the specified model
+            # Validate API key first
+            is_valid, validation_issues = debugger.validate_api_key(api_key)
+            if not is_valid:
+                detailed_error = DetailedError(
+                    error_type="validation",
+                    error_message="API key validation failed",
+                    troubleshooting_tips=validation_issues + [
+                        "🔑 Get a valid API key from https://aistudio.google.com/app/apikey",
+                        "🔑 Ensure you're using Google AI Studio API key, not Google Cloud API key"
+                    ]
+                )
+                return ModelResponse(
+                    model_name=f"Gemini ({model})",
+                    response="",
+                    error=f"API key validation failed: {'; '.join(validation_issues)}",
+                    detailed_error=detailed_error,
+                    response_time=time.time() - start_time
+                )
+            
+            # Construct URL and payload
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens}
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": 0.7
+                }
+            }
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Multi-Model-AI-Comparison/1.0'
             }
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=self.apis['gemini']['headers'](api_key),
-                    json=payload
-                ) as response:
+            # Log request details for debugging
+            if debugger.debug_mode:
+                debugger.log_request_details(url, headers, payload, api_key)
+            
+            # Make the request with timeout
+            timeout = aiohttp.ClientTimeout(total=60, connect=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    response_text = await response.text()
+                    response_headers = dict(response.headers)
+                    
+                    # Log response details
+                    if debugger.debug_mode:
+                        debugger.log_response_details(response.status, response_headers, response_text)
+                    
                     if response.status == 200:
-                        data = await response.json()
-                        model_display = next((k for k, v in self.apis['gemini']['models'].items() if v == model), model)
-                        return ModelResponse(
-                            model_name=f"Gemini ({model_display})",
-                            response=data['candidates'][0]['content']['parts'][0]['text'],
-                            tokens_used=data.get('usageMetadata', {}).get('candidatesTokenCount'),
-                            response_time=time.time() - start_time
-                        )
+                        try:
+                            data = json.loads(response_text)
+                            
+                            # Validate response structure
+                            if 'candidates' not in data:
+                                raise ValueError(f"Unexpected response structure: {data}")
+                            
+                            if not data['candidates']:
+                                raise ValueError("No candidates in response")
+                            
+                            candidate = data['candidates'][0]
+                            if 'content' not in candidate:
+                                raise ValueError(f"No content in candidate: {candidate}")
+                            
+                            content = candidate['content']
+                            if 'parts' not in content or not content['parts']:
+                                raise ValueError(f"No parts in content: {content}")
+                            
+                            response_text = content['parts'][0].get('text', '')
+                            if not response_text:
+                                raise ValueError("Empty response text")
+                            
+                            # Extract token usage
+                            tokens_used = None
+                            if 'usageMetadata' in data:
+                                tokens_used = data['usageMetadata'].get('candidatesTokenCount')
+                            
+                            return ModelResponse(
+                                model_name=f"Gemini ({model})",
+                                response=response_text,
+                                tokens_used=tokens_used,
+                                response_time=time.time() - start_time
+                            )
+                            
+                        except json.JSONDecodeError as e:
+                            detailed_error = DetailedError(
+                                error_type="json_parse",
+                                error_message=f"Failed to parse JSON response: {str(e)}",
+                                http_status=response.status,
+                                response_headers=response_headers,
+                                request_url=url,
+                                request_payload=payload,
+                                raw_response=response_text[:1000],
+                                troubleshooting_tips=[
+                                    "🔧 The API returned invalid JSON - this suggests a server error",
+                                    "🔧 Check if the model name is correct",
+                                    "🔧 Try again in a few minutes",
+                                    f"🔧 Raw response preview: {response_text[:200]}..."
+                                ]
+                            )
+                            return ModelResponse(
+                                model_name=f"Gemini ({model})",
+                                response="",
+                                error=f"JSON parsing failed: {str(e)}",
+                                detailed_error=detailed_error,
+                                response_time=time.time() - start_time
+                            )
+                        
+                        except ValueError as e:
+                            detailed_error = DetailedError(
+                                error_type="response_structure",
+                                error_message=f"Invalid response structure: {str(e)}",
+                                http_status=response.status,
+                                response_headers=response_headers,
+                                request_url=url,
+                                request_payload=payload,
+                                raw_response=response_text[:1000],
+                                troubleshooting_tips=[
+                                    "🔧 The API response doesn't match expected structure",
+                                    "🔧 This might indicate an API version mismatch",
+                                    "🔧 Try a different model or check Gemini API documentation",
+                                    f"🔧 Response structure: {response_text[:300]}..."
+                                ]
+                            )
+                            return ModelResponse(
+                                model_name=f"Gemini ({model})",
+                                response="",
+                                error=f"Response structure error: {str(e)}",
+                                detailed_error=detailed_error,
+                                response_time=time.time() - start_time
+                            )
+                    
                     else:
-                        error_text = await response.text()
-                        model_display = next((k for k, v in self.apis['gemini']['models'].items() if v == model), model)
-                        error_msg = f"HTTP {response.status}: {error_text}"
+                        # Handle HTTP errors with detailed troubleshooting
+                        tips = debugger.get_troubleshooting_tips("http_error", response.status)
                         
-                        # Add helpful context for common errors
-                        if response.status == 404:
-                            error_msg += "\n💡 Tip: Model may not be available in your region or API version"
-                        elif response.status == 403:
-                            error_msg += "\n💡 Tip: Check if Gemini API is enabled in your Google Cloud project"
+                        # Try to parse error details from response
+                        error_details = ""
+                        try:
+                            error_data = json.loads(response_text)
+                            if 'error' in error_data:
+                                error_details = error_data['error'].get('message', '')
+                        except:
+                            error_details = response_text[:500]
+                        
+                        detailed_error = DetailedError(
+                            error_type="http_error",
+                            error_message=f"HTTP {response.status}: {error_details}",
+                            http_status=response.status,
+                            response_headers=response_headers,
+                            request_url=url,
+                            request_payload=payload,
+                            raw_response=response_text,
+                            troubleshooting_tips=tips
+                        )
                         
                         return ModelResponse(
-                            model_name=f"Gemini ({model_display})",
+                            model_name=f"Gemini ({model})",
                             response="",
-                            error=error_msg,
+                            error=f"HTTP {response.status}: {error_details}",
+                            detailed_error=detailed_error,
                             response_time=time.time() - start_time
                         )
-        except Exception as e:
-            model_display = next((k for k, v in self.apis['gemini']['models'].items() if v == model), model)
+        
+        except asyncio.TimeoutError:
+            detailed_error = DetailedError(
+                error_type="timeout",
+                error_message="Request timed out",
+                troubleshooting_tips=debugger.get_troubleshooting_tips("timeout")
+            )
             return ModelResponse(
-                model_name=f"Gemini ({model_display})",
+                model_name=f"Gemini ({model})",
                 response="",
-                error=str(e),
+                error="Request timed out",
+                detailed_error=detailed_error,
+                response_time=time.time() - start_time
+            )
+        
+        except aiohttp.ClientError as e:
+            detailed_error = DetailedError(
+                error_type="connection",
+                error_message=f"Connection error: {str(e)}",
+                troubleshooting_tips=debugger.get_troubleshooting_tips("connection") + [
+                    f"🔧 Specific error: {type(e).__name__}: {str(e)}"
+                ]
+            )
+            return ModelResponse(
+                model_name=f"Gemini ({model})",
+                response="",
+                error=f"Connection error: {str(e)}",
+                detailed_error=detailed_error,
+                response_time=time.time() - start_time
+            )
+        
+        except Exception as e:
+            # Catch-all for unexpected errors with full stack trace
+            stack_trace = traceback.format_exc()
+            logger.error(f"Unexpected error in Gemini query: {stack_trace}")
+            
+            detailed_error = DetailedError(
+                error_type="unexpected",
+                error_message=f"Unexpected error: {str(e)}",
+                troubleshooting_tips=[
+                    "🔧 An unexpected error occurred",
+                    "🔧 Check the application logs for full stack trace",
+                    "🔧 This might be a bug - please report it",
+                    f"🔧 Error type: {type(e).__name__}",
+                    f"🔧 Stack trace: {stack_trace[-500:]}"  # Last 500 chars of stack trace
+                ]
+            )
+            return ModelResponse(
+                model_name=f"Gemini ({model})",
+                response="",
+                error=f"Unexpected error: {str(e)}",
+                detailed_error=detailed_error,
                 response_time=time.time() - start_time
             )
     
@@ -428,6 +755,283 @@ class MultiModelAgent:
                 results.append(response)
         
         return results
+
+def display_detailed_error(response: ModelResponse):
+    """Display detailed error information in Streamlit"""
+    if not response.detailed_error:
+        st.error(f"Error: {response.error}")
+        return
+    
+    error = response.detailed_error
+    
+    # Main error display
+    st.error(f"**{response.model_name}** - {error.error_type.title()} Error")
+    st.write(f"**Message:** {error.error_message}")
+    
+    # HTTP details if available
+    if error.http_status:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("HTTP Status", error.http_status)
+        with col2:
+            st.metric("Response Time", f"{response.response_time:.2f}s")
+    
+    # Troubleshooting tips
+    if error.troubleshooting_tips:
+        with st.expander("🔧 Troubleshooting Tips", expanded=True):
+            for tip in error.troubleshooting_tips:
+                st.write(f"• {tip}")
+    
+    # Technical details for debugging
+    with st.expander("🔍 Technical Details", expanded=False):
+        st.write(f"**Error Type:** {error.error_type}")
+        st.write(f"**Timestamp:** {error.timestamp}")
+        
+        if error.request_url:
+            st.write(f"**Request URL:** {error.request_url}")
+        
+        if error.request_payload:
+            st.write("**Request Payload:**")
+            st.json(error.request_payload)
+        
+        if error.response_headers:
+            st.write("**Response Headers:**")
+            st.json(error.response_headers)
+        
+        if error.raw_response:
+            st.write("**Raw Response:**")
+            st.code(error.raw_response[:1000] + ("..." if len(error.raw_response) > 1000 else ""))
+
+# Test function for API validation
+async def test_gemini_api(api_key: str, model: str = "gemini-1.5-pro") -> Dict[str, Any]:
+    """Test Gemini API with detailed diagnostics"""
+    agent = MultiModelAgent()
+    
+    # Simple test prompt
+    test_prompt = "Hello, please respond with 'API test successful'"
+    
+    result = await agent.query_gemini(test_prompt, api_key, model, max_tokens=50)
+    
+    return {
+        "success": not bool(result.error),
+        "response": result,
+        "diagnostics": {
+            "api_key_length": len(api_key),
+            "model_used": model,
+            "response_time": result.response_time,
+            "error_type": result.detailed_error.error_type if result.detailed_error else None
+        }
+    }
+
+def show_gemini_debug_panel():
+    """Show debug panel for Gemini API testing"""
+    st.subheader("🔧 Gemini API Debug Panel")
+    
+    # API key input
+    debug_api_key = st.text_input(
+        "Gemini API Key for Testing", 
+        type="password",
+        help="Enter your Gemini API key to run diagnostics"
+    )
+    
+    if debug_api_key:
+        # Key validation
+        debugger = GeminiDebugger()
+        is_valid, issues = debugger.validate_api_key(debug_api_key)
+        
+        if not is_valid:
+            st.error("API Key Issues:")
+            for issue in issues:
+                st.write(f"• {issue}")
+        else:
+            st.success("✅ API key format looks valid")
+        
+        # Model selection for testing
+        test_model = st.selectbox(
+            "Model to Test",
+            ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.5-pro-latest", "gemini-pro"],
+            help="Select a model to test"
+        )
+        
+        # Test button
+        if st.button("🧪 Run API Test"):
+            with st.spinner("Testing Gemini API..."):
+                test_result = asyncio.run(test_gemini_api(debug_api_key, test_model))
+            
+            if test_result["success"]:
+                st.success("✅ API test successful!")
+                st.write(f"Response: {test_result['response'].response}")
+                st.json(test_result["diagnostics"])
+            else:
+                st.error("❌ API test failed")
+                display_detailed_error(test_result["response"])
+
+def get_provider_from_model_name(model_name: str) -> str:
+    """Extract provider from model response name"""
+    if "Claude" in model_name:
+        return "claude"
+    elif "ChatGPT" in model_name:
+        return "chatgpt"
+    elif "Gemini" in model_name:
+        return "gemini"
+    return "unknown"
+
+def display_side_by_side(responses: List[ModelResponse]):
+    """Display responses in side-by-side columns with copy buttons and retry"""
+    cols = st.columns(len(responses))
+    
+    for i, response in enumerate(responses):
+        with cols[i]:
+            if response.error:
+                # Use enhanced error display for Gemini
+                if "Gemini" in response.model_name and response.detailed_error:
+                    display_detailed_error(response)
+                else:
+                    st.error(f"**{response.model_name}** - Error: {response.error}")
+                
+                # Add retry functionality for failed responses
+                provider = get_provider_from_model_name(response.model_name)
+                if provider != "unknown":
+                    if st.button(f"🔄 Retry {provider.title()}", key=f"retry_{provider}_{i}"):
+                        st.session_state[f"retry_{provider}"] = True
+                        st.rerun()
+            else:
+                # Success header with metrics and copy button
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.success(f"**{response.model_name}** ({response.response_time:.2f}s)")
+                with col2:
+                    # Native Streamlit copy functionality with feedback
+                    if st.button("📋", key=f"copy_sb_{i}", help="Copy response to clipboard"):
+                        # Store the response in session state for copying
+                        st.session_state[f"copied_text_{i}"] = response.response
+                        st.success("✅ Copied!")
+                        time.sleep(1)
+                        st.rerun()
+                
+                # Response content in expandable code block for easy copying
+                with st.expander("📝 Response", expanded=True):
+                    st.text_area(
+                        "Response content (select all and copy):",
+                        value=response.response,
+                        height=200,
+                        key=f"response_text_{i}",
+                        help="Select all text (Ctrl+A/Cmd+A) and copy (Ctrl+C/Cmd+C)"
+                    )
+                
+                # Token info
+                if response.tokens_used:
+                    st.caption(f"Tokens: {response.tokens_used}")
+
+def display_sequential(responses: List[ModelResponse]):
+    """Display responses one after another with copy buttons and retry"""
+    for i, response in enumerate(responses):
+        st.subheader(f"{response.model_name}")
+        
+        if response.error:
+            # Use enhanced error display for Gemini
+            if "Gemini" in response.model_name and response.detailed_error:
+                display_detailed_error(response)
+            else:
+                st.error(f"Error: {response.error}")
+            
+            # Add retry functionality for failed responses
+            provider = get_provider_from_model_name(response.model_name)
+            if provider != "unknown":
+                if st.button(f"🔄 Retry {provider.title()}", key=f"retry_seq_{provider}_{i}"):
+                    st.session_state[f"retry_{provider}"] = True
+                    st.rerun()
+        else:
+            # Metrics and controls
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Response Time", f"{response.response_time:.2f}s")
+            with col2:
+                st.metric("Tokens", response.tokens_used or "N/A")
+            with col3:
+                if st.button(f"👍 Select", key=f"select_{response.model_name}_{i}"):
+                    st.session_state[f"selected_response"] = response.response
+                    st.success("Response selected!")
+            with col4:
+                # Copy button with feedback
+                if st.button("📋 Copy", key=f"copy_seq_{i}"):
+                    st.session_state[f"copied_text_{i}"] = response.response
+                    st.success("✅ Copied to clipboard!")
+                    time.sleep(1)
+                    st.rerun()
+            
+            # Response content in copyable format
+            st.text_area(
+                "Response (select all and copy):",
+                value=response.response,
+                height=150,
+                key=f"seq_response_{i}",
+                help="Select all (Ctrl+A/Cmd+A) and copy (Ctrl+C/Cmd+C)"
+            )
+        
+        st.divider()
+
+def display_detailed_analysis(responses: List[ModelResponse]):
+    """Display with detailed comparison metrics, copy buttons and retry"""
+    # Summary metrics
+    st.subheader("📊 Comparison Summary")
+    
+    successful_responses = [r for r in responses if not r.error]
+    if successful_responses:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            avg_time = sum(r.response_time for r in successful_responses) / len(successful_responses)
+            st.metric("Avg Response Time", f"{avg_time:.2f}s")
+        with col2:
+            total_tokens = sum(r.tokens_used or 0 for r in successful_responses)
+            st.metric("Total Tokens", total_tokens)
+        with col3:
+            success_rate = len(successful_responses) / len(responses) * 100
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+    
+    # Individual responses
+    st.subheader("📝 Individual Responses")
+    
+    for i, response in enumerate(responses):
+        with st.expander(f"{response.model_name} - {'✅' if not response.error else '❌'}", expanded=True):
+            if response.error:
+                # Use enhanced error display for Gemini
+                if "Gemini" in response.model_name and response.detailed_error:
+                    display_detailed_error(response)
+                else:
+                    st.error(f"Error: {response.error}")
+                
+                # Add retry functionality for failed responses
+                provider = get_provider_from_model_name(response.model_name)
+                if provider != "unknown":
+                    if st.button(f"🔄 Retry {provider.title()}", key=f"retry_detail_{provider}_{i}"):
+                        st.session_state[f"retry_{provider}"] = True
+                        st.rerun()
+            else:
+                # Header with copy button and metrics
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    st.caption(f"Time: {response.response_time:.2f}s | Tokens: {response.tokens_used or 'N/A'}")
+                with col2:
+                    # Copy button with immediate feedback
+                    if st.button("📋 Copy", key=f"copy_detail_{i}"):
+                        # Create a temporary code block for easy copying
+                        st.session_state[f"show_copy_{i}"] = True
+                        st.rerun()
+                with col3:
+                    if st.session_state.get(f"show_copy_{i}"):
+                        if st.button("✅ Done", key=f"hide_copy_{i}"):
+                            st.session_state[f"show_copy_{i}"] = False
+                            st.rerun()
+                
+                # Show copyable text area when copy is clicked
+                if st.session_state.get(f"show_copy_{i}"):
+                    st.info("👇 Select all text below and copy (Ctrl+A then Ctrl+C)")
+                    st.code(response.response, language=None)
+                
+                # Always show the formatted response
+                st.markdown("**Response:**")
+                st.markdown(response.response)
 
 # Streamlit UI
 def main():
@@ -477,6 +1081,10 @@ def main():
     st.title("🤖 Multi-Model AI Comparison Tool")
     st.markdown("Compare responses from Claude, ChatGPT, and Gemini in parallel")
     
+    # Add enhanced Gemini debug panel in sidebar
+    with st.sidebar.expander("🔧 Gemini Debug Panel", expanded=False):
+        show_gemini_debug_panel()
+    
     # Sidebar for API keys
     st.sidebar.header("🔑 API Configuration")
     
@@ -521,7 +1129,7 @@ def main():
     
     model_selections = st.session_state.model_selections if remember_keys else {}
     
-    # API key inputs with help text and model selection
+    # API key inputs with help text and model selection (keeping the existing structure)
     with st.sidebar.expander("🤖 Claude (Anthropic)", expanded=True):
         claude_key = st.text_input(
             "Claude API Key", 
@@ -674,7 +1282,7 @@ def main():
             help="Maximum length of responses"
         )
     
-    # Handle retry requests
+    # Handle retry requests (keeping existing retry logic)
     retry_providers = ['claude', 'chatgpt', 'gemini']
     for provider in retry_providers:
         if st.session_state.get(f"retry_{provider}"):
@@ -736,7 +1344,7 @@ def main():
             else:
                 st.error(f"❌ Failed to load {provider} models")
     
-    # Add example prompts
+    # Add example prompts (keeping existing)
     with st.expander("💡 Example Prompts"):
         example_col1, example_col2 = st.columns(2)
         
@@ -802,7 +1410,7 @@ def main():
                 st.error(f"❌ Error: {str(e)}")
                 logger.error(f"Error querying models: {e}")
     
-    # Display results from session state if available
+    # Display results from session state if available (keeping existing display logic)
     if st.session_state.last_responses:
         responses = st.session_state.last_responses
         
@@ -821,7 +1429,7 @@ def main():
         else:
             display_detailed_analysis(responses)
         
-        # Add export options
+        # Add export options (keeping existing export logic)
         st.markdown("---")
         st.subheader("📤 Export Options")
         export_col1, export_col2, export_col3 = st.columns(3)
@@ -903,7 +1511,7 @@ def main():
                     del st.session_state[key]
             st.rerun()
     
-    # Footer
+    # Footer (keeping existing)
     st.markdown("---")
     footer_col1, footer_col2, footer_col3 = st.columns(3)
     
@@ -920,7 +1528,7 @@ def main():
         else:
             st.markdown("📋 **Copy**: Native Streamlit clipboard support")
     
-    # Environment variable instructions
+    # Environment variable instructions (keeping existing)
     with st.expander("🔧 Environment Variable Setup"):
         st.markdown("""
         **To avoid entering API keys manually, set these environment variables:**
@@ -956,193 +1564,56 @@ def main():
         **Note**: Environment variables are loaded on startup and can be overridden manually in the UI.
         """)
     
-    # Debug section for troubleshooting
+    # Enhanced debug section
     with st.expander("🔧 Debug & Troubleshooting"):
         st.markdown("""
-        **Common Issues:**
+        **Enhanced Gemini Debugging:**
         
-        **Gemini API Problems:**
-        - `'models'` error: Usually API key issue or model discovery failure
-        - Check logs with `make logs` for detailed error messages
-        - Try different Gemini model (1.5 Pro vs 1.5 Flash)
-        - Verify API key at https://ai.google.dev
+        The app now includes enhanced error reporting for Gemini API issues:
+        - ✅ **API Key Validation**: Checks key format before making requests
+        - 🔍 **Detailed Error Messages**: Specific troubleshooting tips for each error type
+        - 📋 **Request/Response Logging**: Full request details logged for debugging
+        - 🛠️ **Debug Panel**: Test API keys and diagnose issues in the sidebar
         
-        **API Key Testing:**
+        **Common Gemini Issues & Solutions:**
+        
+        **API Key Problems:**
+        - `validation failed`: Key format invalid or wrong service key
+        - `401 Unauthorized`: Invalid or expired API key
+        - Solution: Get fresh key from https://aistudio.google.com/app/apikey
+        
+        **Model Availability:**
+        - `404 Not Found`: Model doesn't exist or not available in your region
+        - `403 Forbidden`: Model access restricted or quota exceeded
+        - Solution: Try different model (gemini-1.5-pro vs gemini-1.5-flash)
+        
+        **Response Structure Issues:**
+        - `json_parse`: Invalid JSON response (server error)
+        - `response_structure`: Unexpected API response format
+        - Solution: Check logs for raw response, try again later
+        
+        **Testing Commands:**
         ```bash
-        # Test Gemini API key
-        curl "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_API_KEY"
+        # Test your Gemini API key
+        curl "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
         
-        # Test Claude API key  
-        curl https://api.anthropic.com/v1/models \\
-          -H "x-api-key: YOUR_API_KEY" \\
-          -H "anthropic-version: 2023-06-01"
-        
-        # Test OpenAI API key
-        curl https://api.openai.com/v1/models \\
-          -H "Authorization: Bearer YOUR_API_KEY"
+        # Test simple generation
+        curl -X POST \\
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=YOUR_KEY" \\
+          -H "Content-Type: application/json" \\
+          -d '{"contents": [{"parts": [{"text": "Hello"}]}]}'
         ```
         
-        **Model Discovery Debug:**
-        - 🔄 Dynamic: Models loaded from API successfully
-        - 📋 Static: Using fallback models (API discovery failed)
-        - Check container logs for detailed error messages
+        **Debug Logs:**
+        - Check container logs: `make logs` or `docker logs container_name`
+        - Look for "🚀 Gemini API Request" and "📥 Gemini API Response" entries
+        - Full request/response details are logged for troubleshooting
+        
+        **Getting Help:**
+        - Use the Gemini Debug Panel in the sidebar to test your API key
+        - Check the detailed error information in failed responses
+        - Review troubleshooting tips provided for each error type
         """)
-
-
-def get_provider_from_model_name(model_name: str) -> str:
-    """Extract provider from model response name"""
-    if "Claude" in model_name:
-        return "claude"
-    elif "ChatGPT" in model_name:
-        return "chatgpt"
-    elif "Gemini" in model_name:
-        return "gemini"
-    return "unknown"
-
-def display_side_by_side(responses: List[ModelResponse]):
-    """Display responses in side-by-side columns with copy buttons and retry"""
-    cols = st.columns(len(responses))
-    
-    for i, response in enumerate(responses):
-        with cols[i]:
-            if response.error:
-                st.error(f"**{response.model_name}** - Error: {response.error}")
-                
-                # Add retry functionality for failed responses
-                provider = get_provider_from_model_name(response.model_name)
-                if provider != "unknown":
-                    if st.button(f"🔄 Retry {provider.title()}", key=f"retry_{provider}_{i}"):
-                        st.session_state[f"retry_{provider}"] = True
-                        st.rerun()
-            else:
-                # Success header with metrics and copy button
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.success(f"**{response.model_name}** ({response.response_time:.2f}s)")
-                with col2:
-                    # Native Streamlit copy functionality with feedback
-                    if st.button("📋", key=f"copy_sb_{i}", help="Copy response to clipboard"):
-                        # Store the response in session state for copying
-                        st.session_state[f"copied_text_{i}"] = response.response
-                        st.success("✅ Copied!")
-                        time.sleep(1)
-                        st.rerun()
-                
-                # Response content in expandable code block for easy copying
-                with st.expander("📝 Response", expanded=True):
-                    st.text_area(
-                        "Response content (select all and copy):",
-                        value=response.response,
-                        height=200,
-                        key=f"response_text_{i}",
-                        help="Select all text (Ctrl+A/Cmd+A) and copy (Ctrl+C/Cmd+C)"
-                    )
-                
-                # Token info
-                if response.tokens_used:
-                    st.caption(f"Tokens: {response.tokens_used}")
-
-def display_sequential(responses: List[ModelResponse]):
-    """Display responses one after another with copy buttons and retry"""
-    for i, response in enumerate(responses):
-        st.subheader(f"{response.model_name}")
-        
-        if response.error:
-            st.error(f"Error: {response.error}")
-            
-            # Add retry functionality for failed responses
-            provider = get_provider_from_model_name(response.model_name)
-            if provider != "unknown":
-                if st.button(f"🔄 Retry {provider.title()}", key=f"retry_seq_{provider}_{i}"):
-                    st.session_state[f"retry_{provider}"] = True
-                    st.rerun()
-        else:
-            # Metrics and controls
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Response Time", f"{response.response_time:.2f}s")
-            with col2:
-                st.metric("Tokens", response.tokens_used or "N/A")
-            with col3:
-                if st.button(f"👍 Select", key=f"select_{response.model_name}_{i}"):
-                    st.session_state[f"selected_response"] = response.response
-                    st.success("Response selected!")
-            with col4:
-                # Copy button with feedback
-                if st.button("📋 Copy", key=f"copy_seq_{i}"):
-                    st.session_state[f"copied_text_{i}"] = response.response
-                    st.success("✅ Copied to clipboard!")
-                    time.sleep(1)
-                    st.rerun()
-            
-            # Response content in copyable format
-            st.text_area(
-                "Response (select all and copy):",
-                value=response.response,
-                height=150,
-                key=f"seq_response_{i}",
-                help="Select all (Ctrl+A/Cmd+A) and copy (Ctrl+C/Cmd+C)"
-            )
-        
-        st.divider()
-
-def display_detailed_analysis(responses: List[ModelResponse]):
-    """Display with detailed comparison metrics, copy buttons and retry"""
-    # Summary metrics
-    st.subheader("📊 Comparison Summary")
-    
-    successful_responses = [r for r in responses if not r.error]
-    if successful_responses:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            avg_time = sum(r.response_time for r in successful_responses) / len(successful_responses)
-            st.metric("Avg Response Time", f"{avg_time:.2f}s")
-        with col2:
-            total_tokens = sum(r.tokens_used or 0 for r in successful_responses)
-            st.metric("Total Tokens", total_tokens)
-        with col3:
-            success_rate = len(successful_responses) / len(responses) * 100
-            st.metric("Success Rate", f"{success_rate:.1f}%")
-    
-    # Individual responses
-    st.subheader("📝 Individual Responses")
-    
-    for i, response in enumerate(responses):
-        with st.expander(f"{response.model_name} - {'✅' if not response.error else '❌'}", expanded=True):
-            if response.error:
-                st.error(f"Error: {response.error}")
-                
-                # Add retry functionality for failed responses
-                provider = get_provider_from_model_name(response.model_name)
-                if provider != "unknown":
-                    if st.button(f"🔄 Retry {provider.title()}", key=f"retry_detail_{provider}_{i}"):
-                        st.session_state[f"retry_{provider}"] = True
-                        st.rerun()
-            else:
-                # Header with copy button and metrics
-                col1, col2, col3 = st.columns([2, 1, 1])
-                with col1:
-                    st.caption(f"Time: {response.response_time:.2f}s | Tokens: {response.tokens_used or 'N/A'}")
-                with col2:
-                    # Copy button with immediate feedback
-                    if st.button("📋 Copy", key=f"copy_detail_{i}"):
-                        # Create a temporary code block for easy copying
-                        st.session_state[f"show_copy_{i}"] = True
-                        st.rerun()
-                with col3:
-                    if st.session_state.get(f"show_copy_{i}"):
-                        if st.button("✅ Done", key=f"hide_copy_{i}"):
-                            st.session_state[f"show_copy_{i}"] = False
-                            st.rerun()
-                
-                # Show copyable text area when copy is clicked
-                if st.session_state.get(f"show_copy_{i}"):
-                    st.info("👇 Select all text below and copy (Ctrl+A then Ctrl+C)")
-                    st.code(response.response, language=None)
-                
-                # Always show the formatted response
-                st.markdown("**Response:**")
-                st.markdown(response.response)
 
 if __name__ == "__main__":
     main()
