@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import streamlit as st
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any
+from typing import Dict, List, Optional, Tuple, Any
 import json
 import time
 import os
@@ -10,6 +10,12 @@ from datetime import datetime
 import logging
 import traceback
 import re
+
+# Import the new modules
+from clipboard_utils import create_copy_button, create_copy_section, inject_copy_script
+from default_models import DefaultModelConfig, select_models_with_defaults, render_use_case_selector, ENV_TEMPLATE_WITH_DEFAULTS
+from budget_tracker import BudgetTracker, render_budget_dashboard, integrate_budget_tracking, setup_budget_tracking
+
 
 # Enhanced logging configuration
 logging.basicConfig(
@@ -26,6 +32,103 @@ def load_env_api_keys():
         'chatgpt': os.getenv('OPENAI_API_KEY', ''), 
         'gemini': os.getenv('GOOGLE_API_KEY', '')
     }
+
+def initialize_default_models(api_keys: Dict[str, str]) -> Tuple[Dict[str, str], str]:
+    """
+    Initialize model selections with defaults
+    
+    Returns:
+        Tuple of (model_selections, status_message)
+    """
+    config = DefaultModelConfig()
+    auto_select = os.getenv('AUTO_SELECT_MODELS', 'true').lower() == 'true'
+    default_use_case = os.getenv('DEFAULT_USE_CASE', 'default')
+    
+    if not auto_select:
+        return {}, "Auto-selection disabled"
+    
+    # This would be called after model discovery
+    status_messages = []
+    model_selections = {}
+    
+    for provider in ['claude', 'chatgpt', 'gemini']:
+        if api_keys.get(provider):
+            default_model = config.get_default_model(provider, default_use_case)
+            if default_model:
+                model_selections[provider] = default_model
+                status_messages.append(f"✅ {provider}: {default_model}")
+            else:
+                status_messages.append(f"⚠️ {provider}: no default configured")
+    
+    status = f"Auto-selected models: {', '.join(status_messages)}"
+    return model_selections, status
+
+# Streamlit UI integration
+def render_model_selection_with_defaults(st, provider: str, available_models: Dict[str, str], 
+                                       config: DefaultModelConfig, use_case: str = 'default') -> str:
+    """Render model selection with smart defaults"""
+    
+    if not available_models:
+        st.error(f"❌ No {provider} models available")
+        return None
+    
+    # Get default model
+    default_model_id = config.get_default_model(provider, use_case)
+    default_index = 0
+    
+    # Find index of default model
+    if default_model_id:
+        model_ids = list(available_models.values())
+        try:
+            default_index = model_ids.index(default_model_id)
+        except ValueError:
+            # Try partial match
+            for i, model_id in enumerate(model_ids):
+                if default_model_id in model_id or model_id in default_model_id:
+                    default_index = i
+                    break
+    
+    # Model selectbox with default pre-selected
+    model_names = list(available_models.keys())
+    selected_name = st.selectbox(
+        f"{provider.title()} Model",
+        options=model_names,
+        index=default_index,
+        help=f"Default: {default_model_id}" if default_model_id else "No default configured"
+    )
+    
+    return available_models[selected_name]
+
+def render_use_case_selector(st, config: DefaultModelConfig) -> str:
+    """Render use case selector for model preferences"""
+    
+    use_cases = {
+        'default': '🎯 Default (Balanced)',
+        'fast': '⚡ Fast (Quick responses)',
+        'quality': '💎 Quality (Best results)',
+        'cost_effective': '💰 Cost-effective (Cheapest)'
+    }
+    
+    default_use_case = os.getenv('DEFAULT_USE_CASE', 'default')
+    default_index = list(use_cases.keys()).index(default_use_case) if default_use_case in use_cases else 0
+    
+    selected_use_case = st.selectbox(
+        "Model Selection Strategy",
+        options=list(use_cases.keys()),
+        format_func=lambda x: use_cases[x],
+        index=default_index,
+        help="Choose optimization strategy for model selection"
+    )
+    
+    # Show what models would be selected
+    if selected_use_case != 'default':
+        preferences = config.get_preferences_for_use_case(selected_use_case)
+        with st.expander(f"Models for {use_cases[selected_use_case]}", expanded=False):
+            for provider, model in preferences.items():
+                if model:
+                    st.write(f"• **{provider.title()}**: {model}")
+    
+    return selected_use_case
 
 @dataclass
 class DetailedError:
@@ -1032,6 +1135,48 @@ def display_detailed_analysis(responses: List[ModelResponse]):
                 # Always show the formatted response
                 st.markdown("**Response:**")
                 st.markdown(response.response)
+                
+def display_response_with_copy(response, index: int):
+    """Enhanced response display with working copy functionality"""
+    
+    if response.error:
+        st.error(f"**{response.model_name}** - Error: {response.error}")
+        return
+    
+    # Success header with metrics
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.success(f"**{response.model_name}** ({response.response_time:.2f}s)")
+    with col2:
+        if response.tokens_used:
+            st.metric("Tokens", response.tokens_used)
+    with col3:
+        # Enhanced copy button that actually works
+        create_copy_button(
+            text=response.response,
+            button_text="📋 Copy",
+            key=f"response_copy_{index}"
+        )
+    
+    # Response content with copy options
+    create_copy_section(
+        text=response.response,
+        title="📝 Response Content",
+        key=f"response_section_{index}"
+    )
+
+
+def setup_budget_tracking() -> Optional[BudgetTracker]:
+    """Setup budget tracking if enabled"""
+    if os.getenv('TRACK_USAGE', 'false').lower() == 'true':
+        try:
+            tracker = BudgetTracker()
+            logger.info("💰 Budget tracking enabled")
+            return tracker
+        except Exception as e:
+            logger.error(f"Failed to initialize budget tracking: {e}")
+            return None
+    return None
 
 # Streamlit UI
 def main():
@@ -1041,13 +1186,9 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Load environment variables
-    env_keys = load_env_api_keys()
-    
-    # Initialize session state for persistent data
+    # Initialize session state variables FIRST
     if 'api_keys' not in st.session_state:
-        # Initialize with environment variables if available
-        st.session_state.api_keys = {k: v for k, v in env_keys.items() if v}
+        st.session_state.api_keys = {}
     if 'model_selections' not in st.session_state:
         st.session_state.model_selections = {}
     if 'last_responses' not in st.session_state:
@@ -1055,199 +1196,183 @@ def main():
     if 'last_prompt' not in st.session_state:
         st.session_state.last_prompt = ""
     if 'remember_keys' not in st.session_state:
-        st.session_state.remember_keys = bool(any(env_keys.values()))  # Auto-enable if env vars found
-    if 'retry_claude' not in st.session_state:
-        st.session_state.retry_claude = False
-    if 'retry_chatgpt' not in st.session_state:
-        st.session_state.retry_chatgpt = False
-    if 'retry_gemini' not in st.session_state:
-        st.session_state.retry_gemini = False
-    if 'show_all_text' not in st.session_state:
-        st.session_state.show_all_text = False
-    if 'show_statistics' not in st.session_state:
-        st.session_state.show_statistics = False
-    if 'initialized' not in st.session_state:
-        st.session_state.initialized = True
-        # Show info about loaded environment variables
-        if any(env_keys.values()):
-            loaded_keys = [k for k, v in env_keys.items() if v]
-            st.sidebar.success(f"🔑 Loaded from environment: {', '.join(loaded_keys)}")
+        st.session_state.remember_keys = True  # Default to True
+    if 'use_case' not in st.session_state:
+        st.session_state.use_case = 'default'
+    if 'budget_visible' not in st.session_state:
+        st.session_state.budget_visible = True
     
-    # Add health check endpoint for Docker
-    if st.query_params.get("health") == "check":
-        st.write("OK")
-        return
+    # Load environment variables
+    env_keys = load_env_api_keys()
+    
+    # Now you can safely use st.session_state.remember_keys
+    current_api_keys = st.session_state.api_keys.copy() if st.session_state.remember_keys else env_keys.copy()
+    
+    # =========================================================================
+    # 1. INITIALIZE ALL ENHANCEMENTS
+    # =========================================================================
+    
+    # Load environment variables with defaults
+    env_keys = load_env_api_keys()
+    
+    # Initialize default model configuration
+    default_config = DefaultModelConfig()
+    
+    # Initialize budget tracking if enabled
+    budget_tracker = setup_budget_tracking()
+    
+    # Inject copy functionality scripts
+    if os.getenv('ENABLE_COPY_BUTTONS', 'true').lower() == 'true':
+        inject_copy_script()
+    
+    # Initialize session state with new features
+    if 'api_keys' not in st.session_state:
+        st.session_state.api_keys = {k: v for k, v in env_keys.items() if v}
+    if 'model_selections' not in st.session_state:
+        st.session_state.model_selections = {}
+    if 'use_case' not in st.session_state:
+        st.session_state.use_case = os.getenv('DEFAULT_USE_CASE', 'default')
+    if 'budget_visible' not in st.session_state:
+        st.session_state.budget_visible = os.getenv('SHOW_BUDGET_DASHBOARD', 'true').lower() == 'true'
+    
+    # =========================================================================
+    # 2. ENHANCED UI WITH BUDGET DASHBOARD
+    # =========================================================================
     
     st.title("🤖 Multi-Model AI Comparison Tool")
     st.markdown("Compare responses from Claude, ChatGPT, and Gemini in parallel")
     
-    # Add enhanced Gemini debug panel in sidebar
-    with st.sidebar.expander("🔧 Gemini Debug Panel", expanded=False):
-        show_gemini_debug_panel()
+    # Budget dashboard at the top (if enabled and tracker available)
+    if budget_tracker and st.session_state.budget_visible:
+        with st.container():
+            render_budget_dashboard(st, budget_tracker)
+            st.markdown("---")
     
-    # Sidebar for API keys
+    # =========================================================================
+    # 3. ENHANCED SIDEBAR WITH DEFAULT MODELS
+    # =========================================================================
+    
     st.sidebar.header("🔑 API Configuration")
+    
+    # Use case selector for model optimization
+    st.session_state.use_case = render_use_case_selector(st.sidebar, default_config)
     
     # Environment variable status
     if any(env_keys.values()):
-        with st.sidebar.expander("📋 Environment Variables", expanded=False):
+        with st.sidebar.expander("📋 Environment Status", expanded=False):
             for service, key in env_keys.items():
                 if key:
                     masked_key = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else key[:4] + "..."
                     st.text(f"{service.upper()}: {masked_key}")
+                    
+                    # Show default model for this service
+                    default_model = default_config.get_default_model(service, st.session_state.use_case)
+                    if default_model:
+                        st.caption(f"Default: {default_model}")
                 else:
                     st.text(f"{service.upper()}: Not set")
     
-    # Remember keys option
-    remember_keys = st.sidebar.checkbox(
-        "Remember keys this session",
-        value=st.session_state.remember_keys,
-        help="Keep API keys until browser refresh. Note: Browser refresh will always clear everything for security."
-    )
-    st.session_state.remember_keys = remember_keys
+    # Enhanced API key configuration with auto-model selection
+    current_api_keys = st.session_state.api_keys.copy() if st.session_state.remember_keys else env_keys.copy()
+    model_selections = {}
     
-    if not remember_keys:
-        st.sidebar.markdown("🔒 Keys cleared after each interaction")
-    else:
-        st.sidebar.markdown("🔄 Keys stored until page refresh")
+    # Configure each provider with enhanced model selection
+    agent = MultiModelAgent()
     
-    # Warning about refresh behavior
-    if remember_keys:
-        st.sidebar.warning("⚠️ Page refresh will clear all data (including results)")
-    
-    # Get API keys (from session state if remembering, otherwise use current values)
-    if remember_keys:
-        # Use session state, but allow override from environment
-        current_api_keys = st.session_state.api_keys.copy()
-        # Fill in any missing keys from environment
-        for k, v in env_keys.items():
-            if v and not current_api_keys.get(k):
-                current_api_keys[k] = v
-    else:
-        # Start fresh each time, but pre-fill with environment variables
-        current_api_keys = env_keys.copy()
-    
-    model_selections = st.session_state.model_selections if remember_keys else {}
-    
-    # API key inputs with help text and model selection (keeping the existing structure)
-    with st.sidebar.expander("🤖 Claude (Anthropic)", expanded=True):
-        claude_key = st.text_input(
-            "Claude API Key", 
-            value=current_api_keys.get('claude', ''),
-            type="password", 
-            help="Get your key at: https://console.anthropic.com (or set ANTHROPIC_API_KEY env var)"
-        )
-        if claude_key:
-            current_api_keys['claude'] = claude_key
-            if remember_keys:
-                st.session_state.api_keys['claude'] = claude_key
-            
-            # Get available models dynamically
-            agent = MultiModelAgent()
-            with st.spinner("🔍 Discovering Claude models..."):
-                claude_models, is_dynamic = asyncio.run(agent.get_available_models('claude', claude_key))
-            
-            if claude_models:
-                claude_model_key = st.selectbox(
-                    "Claude Model",
-                    options=list(claude_models.keys()),
-                    index=0,
-                    help="Choose which Claude model to use"
-                )
-                model_selections['claude'] = claude_models[claude_model_key]
-                if remember_keys:
-                    st.session_state.model_selections['claude'] = model_selections['claude']
+    for provider, display_name, emoji in [
+        ('claude', 'Claude (Anthropic)', '🤖'),
+        ('chatgpt', 'ChatGPT (OpenAI)', '🧠'), 
+        ('gemini', 'Gemini (Google)', '✨')
+    ]:
+        with st.sidebar.expander(f"{emoji} {display_name}", expanded=True):
+            # Get environment variable for this provider
+            env_key = env_keys.get(provider, '')
+
+            api_key = st.text_input(
+                f"{display_name} API Key",
+                value=env_key,  # Pre-fill with environment variable
+                type="password",
+                help=f"Enter your {display_name} API key (loaded from env: {'✅' if env_key else '❌'})"
+            )
+
+            # Update current_api_keys with the value (env or user input)
+            if api_key:
+                current_api_keys[provider] = api_key
+                if st.session_state.remember_keys:
+                    st.session_state.api_keys[provider] = api_key
                 
-                # Show source of API key and model info
-                key_source = "env var" if env_keys.get('claude') and claude_key == env_keys['claude'] else "manual"
-                model_source = "🔄 dynamic" if is_dynamic else "📋 static"
-                st.success(f"✅ Claude key configured ({claude_model_key}) [{key_source}] [{model_source}]")
-            else:
-                st.error("❌ Failed to load Claude models")
-    
-    with st.sidebar.expander("🧠 ChatGPT (OpenAI)", expanded=True):
-        chatgpt_key = st.text_input(
-            "OpenAI API Key", 
-            value=current_api_keys.get('chatgpt', ''),
-            type="password",
-            help="Get your key at: https://platform.openai.com (or set OPENAI_API_KEY env var)"
-        )
-        if chatgpt_key:
-            current_api_keys['chatgpt'] = chatgpt_key
-            if remember_keys:
-                st.session_state.api_keys['chatgpt'] = chatgpt_key
-            
-            # Get available models dynamically
-            agent = MultiModelAgent()
-            with st.spinner("🔍 Discovering OpenAI models..."):
-                openai_models, is_dynamic = asyncio.run(agent.get_available_models('chatgpt', chatgpt_key))
-            
-            if openai_models:
-                openai_model_key = st.selectbox(
-                    "OpenAI Model",
-                    options=list(openai_models.keys()),
-                    index=0,
-                    help="Choose which OpenAI model to use"
-                )
-                model_selections['chatgpt'] = openai_models[openai_model_key]
-                if remember_keys:
-                    st.session_state.model_selections['chatgpt'] = model_selections['chatgpt']
+                # Get available models with loading indicator
+                with st.spinner(f"🔍 Loading {display_name} models..."):
+                    available_models, is_dynamic = asyncio.run(
+                        agent.get_available_models(provider, api_key)
+                    )
                 
-                # Show source of API key and model info
-                key_source = "env var" if env_keys.get('chatgpt') and chatgpt_key == env_keys['chatgpt'] else "manual"
-                model_source = "🔄 dynamic" if is_dynamic else "📋 static"
-                st.success(f"✅ OpenAI key configured ({openai_model_key}) [{key_source}] [{model_source}]")
-            else:
-                st.error("❌ Failed to load OpenAI models")
+                if available_models:
+                    # Enhanced model selection with defaults
+                    default_model_id = default_config.get_default_model(provider, st.session_state.use_case)
+                    
+                    # Find default model index
+                    model_names = list(available_models.keys())
+                    model_ids = list(available_models.values())
+                    default_index = 0
+                    
+                    if default_model_id:
+                        try:
+                            default_index = model_ids.index(default_model_id)
+                            st.success(f"✅ Using default: {model_names[default_index]}")
+                        except ValueError:
+                            # Try partial match
+                            for i, model_id in enumerate(model_ids):
+                                if default_model_id in model_id:
+                                    default_index = i
+                                    st.info(f"🔄 Using similar: {model_names[default_index]}")
+                                    break
+                            else:
+                                st.warning(f"⚠️ Default model '{default_model_id}' not found, using {model_names[0]}")
+                    
+                    # Model selection with default pre-selected
+                    selected_model_name = st.selectbox(
+                        f"{display_name} Model",
+                        options=model_names,
+                        index=default_index,
+                        key=f"model_select_{provider}",
+                        help=f"Default for '{st.session_state.use_case}' mode: {default_model_id}"
+                    )
+                    
+                    model_selections[provider] = available_models[selected_model_name]
+                    
+                    # Show model info
+                    pricing_info = ""
+                    if budget_tracker:
+                        pricing = budget_tracker.pricing_calc.get_model_pricing(provider, model_selections[provider])
+                        pricing_info = f" (${pricing['input']:.4f}/1k in, ${pricing['output']:.4f}/1k out)"
+                    
+                    model_source = "🔄 dynamic" if is_dynamic else "📋 static"
+                    st.caption(f"Selected: {selected_model_name} [{model_source}]{pricing_info}")
+                else:
+                    st.error(f"❌ Failed to load {display_name} models")
     
-    with st.sidebar.expander("✨ Gemini (Google)", expanded=True):
-        gemini_key = st.text_input(
-            "Gemini API Key", 
-            value=current_api_keys.get('gemini', ''),
-            type="password",
-            help="Get your key at: https://ai.google.dev (or set GOOGLE_API_KEY env var)"
-        )
-        if gemini_key:
-            current_api_keys['gemini'] = gemini_key
-            if remember_keys:
-                st.session_state.api_keys['gemini'] = gemini_key
-            
-            # Get available models dynamically
-            agent = MultiModelAgent()
-            with st.spinner("🔍 Discovering Gemini models..."):
-                gemini_models, is_dynamic = asyncio.run(agent.get_available_models('gemini', gemini_key))
-            
-            if gemini_models:
-                gemini_model_key = st.selectbox(
-                    "Gemini Model",
-                    options=list(gemini_models.keys()),
-                    index=0,
-                    help="Choose which Gemini model to use"
-                )
-                model_selections['gemini'] = gemini_models[gemini_model_key]
-                if remember_keys:
-                    st.session_state.model_selections['gemini'] = model_selections['gemini']
-                
-                # Show source of API key and model info
-                key_source = "env var" if env_keys.get('gemini') and gemini_key == env_keys['gemini'] else "manual"
-                model_source = "🔄 dynamic" if is_dynamic else "📋 static"
-                st.success(f"✅ Gemini key configured ({gemini_model_key}) [{key_source}] [{model_source}]")
-                
-                # Show debug info if using fallback
-                if not is_dynamic:
-                    st.info("ℹ️ Using fallback models. Check logs for model discovery details.")
-            else:
-                st.error("❌ Failed to load Gemini models - check API key and logs")
+    # Store model selections in session state
+    if st.session_state.remember_keys:
+        st.session_state.model_selections = model_selections
     
-    # Show configured models
-    if current_api_keys:
-        configured_count = len([k for k, v in current_api_keys.items() if v])
-        st.sidebar.success(f"🎯 {configured_count} model(s) configured")
-    else:
-        st.sidebar.warning("⚠️ No API keys configured")
+    # =========================================================================
+    # 4. ENHANCED MAIN INTERFACE
+    # =========================================================================
     
-    # Main interface
+    # Main prompt interface
     st.header("📝 Enter your prompt")
+    
+    # Show budget warning if approaching limits
+    if budget_tracker:
+        budget_status = budget_tracker.check_budget_status()
+        if budget_status['daily']['near_limit'] or budget_status['monthly']['near_limit']:
+            st.warning("⚠️ Approaching budget limit. Consider using cost-effective models.")
+            # Auto-suggest cost-effective mode
+            if st.button("💰 Switch to Cost-Effective Models"):
+                st.session_state.use_case = 'cost_effective'
+                st.rerun()
+    
     prompt = st.text_area(
         "Prompt", 
         value=st.session_state.last_prompt,
@@ -1255,12 +1380,8 @@ def main():
         placeholder="Enter your prompt here...\n\nExample: Write a short story about a robot who discovers emotions."
     )
     
-    # Update session state when prompt changes
-    if prompt != st.session_state.last_prompt:
-        st.session_state.last_prompt = prompt
-    
-    # Settings
-    col1, col2, col3 = st.columns(3)
+    # Enhanced settings with budget consideration
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         task_type = st.selectbox(
             "Task Type", 
@@ -1271,6 +1392,9 @@ def main():
         comparison_mode = st.selectbox(
             "Comparison Mode", 
             ["Side by Side", "Sequential", "Detailed Analysis"],
+            index=["Side by Side", "Sequential", "Detailed Analysis"].index(
+                os.getenv('DEFAULT_COMPARISON_MODE', 'Side by Side')
+            ),
             help="How to display the results"
         )
     with col3:
@@ -1279,108 +1403,42 @@ def main():
             min_value=100, 
             max_value=4000, 
             value=2000,
-            help="Maximum length of responses"
+            help="Maximum length of responses (affects cost)"
         )
+    with col4:
+        if budget_tracker:
+            # Show estimated cost for this request
+            estimated_cost = 0.0
+            for provider, model_id in model_selections.items():
+                # Rough estimate: 1 word ≈ 1.3 tokens
+                prompt_tokens = len(prompt.split()) * 1.3
+                completion_tokens = max_tokens * 0.5  # Assume 50% of max tokens used
+                cost = budget_tracker.pricing_calc.calculate_cost(
+                    provider, model_id, int(prompt_tokens), int(completion_tokens)
+                )
+                estimated_cost += cost
+            
+            st.metric("Est. Cost", f"${estimated_cost:.3f}")
     
-    # Handle retry requests (keeping existing retry logic)
-    retry_providers = ['claude', 'chatgpt', 'gemini']
-    for provider in retry_providers:
-        if st.session_state.get(f"retry_{provider}"):
-            st.session_state[f"retry_{provider}"] = False  # Reset the flag
-            
-            # Show retry interface
-            st.subheader(f"🔄 Retry {provider.title()}")
-            
-            # Get current API key
-            current_key = current_api_keys.get(provider)
-            if not current_key:
-                st.error(f"❌ No API key configured for {provider}")
-                continue
-            
-            # Get available models for retry
-            agent = MultiModelAgent()
-            with st.spinner(f"🔍 Loading {provider} models..."):
-                provider_models, _ = asyncio.run(agent.get_available_models(provider, current_key))
-            
-            if provider_models:
-                # Model selection for retry
-                retry_col1, retry_col2 = st.columns([3, 1])
-                with retry_col1:
-                    selected_model_name = st.selectbox(
-                        f"Select {provider.title()} Model for Retry",
-                        options=list(provider_models.keys()),
-                        key=f"retry_model_{provider}"
-                    )
-                    selected_model_id = provider_models[selected_model_name]
-                
-                with retry_col2:
-                    if st.button(f"🚀 Retry {provider.title()}", key=f"execute_retry_{provider}"):
-                        # Execute retry
-                        with st.spinner(f"🔄 Retrying {provider}..."):
-                            retry_response = asyncio.run(
-                                agent.query_single_model(
-                                    st.session_state.last_prompt,
-                                    provider,
-                                    current_key,
-                                    selected_model_id,
-                                    max_tokens
-                                )
-                            )
-                        
-                        # Update the response in session state
-                        if st.session_state.last_responses:
-                            # Find and replace the response for this provider
-                            for i, resp in enumerate(st.session_state.last_responses):
-                                if provider in resp.model_name.lower():
-                                    st.session_state.last_responses[i] = retry_response
-                                    break
-                            else:
-                                # If not found, append new response
-                                st.session_state.last_responses.append(retry_response)
-                        
-                        st.success(f"✅ {provider.title()} retry completed!")
-                        time.sleep(1)
-                        st.rerun()
-            else:
-                st.error(f"❌ Failed to load {provider} models")
+    # =========================================================================
+    # 5. ENHANCED QUERY EXECUTION WITH BUDGET TRACKING
+    # =========================================================================
     
-    # Add example prompts (keeping existing)
-    with st.expander("💡 Example Prompts"):
-        example_col1, example_col2 = st.columns(2)
-        
-        with example_col1:
-            st.markdown("**Creative Writing:**")
-            if st.button("📚 Short Story", help="Generate a creative short story"):
-                st.session_state.example_prompt = "Write a 300-word short story about a time traveler who gets stuck in the year 1823 and has to explain modern technology to the locals."
-            
-            if st.button("🎭 Character Development", help="Create a character"):
-                st.session_state.example_prompt = "Create a detailed character profile for a cyberpunk detective in Neo-Tokyo 2090. Include background, motivations, and unique quirks."
-        
-        with example_col2:
-            st.markdown("**Code Generation:**")
-            if st.button("💻 Python Function", help="Generate Python code"):
-                st.session_state.example_prompt = "Write a Python function that takes a list of dictionaries and returns the top 3 items sorted by a specified key. Include error handling and type hints."
-            
-            if st.button("🌐 Web Component", help="Generate web code"):
-                st.session_state.example_prompt = "Create a responsive React component for a product card that displays an image, title, price, and rating with hover effects."
-    
-    # Use example prompt if set
-    if hasattr(st.session_state, 'example_prompt'):
-        prompt = st.session_state.example_prompt
-        st.session_state.last_prompt = prompt
-        del st.session_state.example_prompt
-        st.rerun()
-    
-    # Query button
     if st.button("🚀 Query All Models", type="primary", use_container_width=True):
         if not prompt.strip():
             st.error("❌ Please enter a prompt")
         elif not current_api_keys or not model_selections:
             st.error("❌ Please enter at least one API key and select a model in the sidebar")
         else:
-            agent = MultiModelAgent()
+            # Check budget before proceeding
+            if budget_tracker:
+                should_block, block_reason = budget_tracker.should_block_request()
+                if should_block:
+                    st.error(f"🚨 Request blocked: {block_reason}")
+                    st.info("💡 Consider increasing your budget limits or waiting until tomorrow.")
+                    return
             
-            # Show progress and timing
+            # Show progress
             start_time = time.time()
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1390,230 +1448,298 @@ def main():
                     status_text.text("🚀 Sending requests to all models...")
                     progress_bar.progress(0.3)
                     
-                    # Run async function in Streamlit
+                    # Wrap query functions with budget tracking if available
+                    if budget_tracker:
+                        agent.query_claude = integrate_budget_tracking(agent.query_claude, budget_tracker)
+                        agent.query_chatgpt = integrate_budget_tracking(agent.query_chatgpt, budget_tracker)
+                        agent.query_gemini = integrate_budget_tracking(agent.query_gemini, budget_tracker)
+                    
+                    # Execute queries
                     responses = asyncio.run(agent.query_all_models(prompt, current_api_keys, model_selections, max_tokens))
                     
                     progress_bar.progress(1.0)
                     total_time = time.time() - start_time
                     status_text.text(f"✅ Completed in {total_time:.2f} seconds")
                     
-                    # Store responses in session state for persistence
+                    # Store responses
                     st.session_state.last_responses = responses
                     st.session_state.last_prompt = prompt
                     
-                    # Small delay to show completion
+                    # Update budget dashboard if visible
+                    if budget_tracker and st.session_state.budget_visible:
+                        st.rerun()
+                    
                     time.sleep(0.5)
                     progress_bar.empty()
                     status_text.empty()
                     
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
-                logger.error(f"Error querying models: {e}")
     
-    # Display results from session state if available (keeping existing display logic)
+    # =========================================================================
+    # 6. ENHANCED RESULTS DISPLAY WITH COPY FUNCTIONALITY
+    # =========================================================================
+    
     if st.session_state.last_responses:
         responses = st.session_state.last_responses
         
-        # Add a separator and show which prompt these results are for
         st.markdown("---")
         st.subheader("📊 Results")
+        
+        # Show prompt used
         if st.session_state.last_prompt:
             with st.expander("💬 Prompt Used", expanded=False):
-                st.write(st.session_state.last_prompt)
+                create_copy_section(
+                    text=st.session_state.last_prompt,
+                    title="Copy Prompt",
+                    key="prompt_copy"
+                )
         
-        # Display results
+        # Enhanced results display with working copy buttons
         if comparison_mode == "Side by Side":
-            display_side_by_side(responses)
+            display_side_by_side_enhanced(responses)
         elif comparison_mode == "Sequential":
-            display_sequential(responses)
+            display_sequential_enhanced(responses)
         else:
-            display_detailed_analysis(responses)
+            display_detailed_analysis_enhanced(responses)
         
-        # Add export options (keeping existing export logic)
+        # Enhanced export options
         st.markdown("---")
-        st.subheader("📤 Export Options")
+        st.subheader("📤 Export & Analytics")
+        
         export_col1, export_col2, export_col3 = st.columns(3)
         
         with export_col1:
-            st.markdown("**📋 Copy All Responses**")
-            all_text = f"Prompt: {st.session_state.last_prompt}\n\n"
+            # Enhanced copy all responses
+            all_responses_text = f"# Multi-Model AI Comparison\n\n"
+            all_responses_text += f"**Prompt:** {st.session_state.last_prompt}\n\n"
+            all_responses_text += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            
             for resp in responses:
                 if not resp.error:
-                    all_text += f"=== {resp.model_name} ===\n{resp.response}\n\n"
+                    all_responses_text += f"## {resp.model_name}\n"
+                    all_responses_text += f"**Response Time:** {resp.response_time:.2f}s\n"
+                    if resp.tokens_used:
+                        all_responses_text += f"**Tokens:** {resp.tokens_used}\n"
+                    all_responses_text += f"\n{resp.response}\n\n---\n\n"
             
-            # Show text area for easy copying
-            if st.button("📋 Show All Responses", key="show_all_responses"):
-                st.session_state.show_all_text = True
-                st.rerun()
-            
-            if st.session_state.get("show_all_text"):
-                st.text_area("All Responses (select all and copy):", all_text, height=200, key="all_responses_text")
-                if st.button("✅ Hide", key="hide_all_responses"):
-                    st.session_state.show_all_text = False
-                    st.rerun()
+            create_copy_section(
+                text=all_responses_text,
+                title="📋 Copy All Responses",
+                key="all_responses_copy"
+            )
         
         with export_col2:
-            st.markdown("**📊 Export as JSON**")
+            # Enhanced JSON export with metadata
             export_data = {
-                "prompt": st.session_state.last_prompt,
-                "timestamp": datetime.now().isoformat(),
-                "responses": [
-                    {
-                        "model": resp.model_name,
-                        "response": resp.response,
-                        "response_time": resp.response_time,
-                        "tokens_used": resp.tokens_used,
-                        "error": resp.error
-                    }
-                    for resp in responses
-                ]
+                "metadata": {
+                    "prompt": st.session_state.last_prompt,
+                    "timestamp": datetime.now().isoformat(),
+                    "use_case": st.session_state.use_case,
+                    "max_tokens": max_tokens,
+                    "task_type": task_type
+                },
+                "responses": []
             }
+            
+            for resp in responses:
+                response_data = {
+                    "model": resp.model_name,
+                    "response": resp.response,
+                    "response_time": resp.response_time,
+                    "tokens_used": resp.tokens_used,
+                    "error": resp.error,
+                    "success": not bool(resp.error)
+                }
+                
+                # Add cost information if budget tracking is enabled
+                if budget_tracker and not resp.error:
+                    # Extract provider and model info
+                    # This would need to be enhanced based on your response structure
+                    pass
+                
+                export_data["responses"].append(response_data)
+            
             st.download_button(
                 "💾 Download JSON",
                 data=json.dumps(export_data, indent=2),
                 file_name=f"ai_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
-                help="Download results as JSON file"
+                help="Download results with metadata as JSON file"
             )
         
         with export_col3:
-            st.markdown("**📈 Statistics**")
-            if st.button("📈 Show Statistics", key="show_stats"):
-                st.session_state.show_statistics = True
-                st.rerun()
-            
-            if st.session_state.get("show_statistics"):
-                successful = [r for r in responses if not r.error]
-                if successful:
-                    stats = {
-                        "total_models": len(responses),
-                        "successful_responses": len(successful),
-                        "average_response_time": f"{sum(r.response_time for r in successful) / len(successful):.2f}s",
-                        "total_tokens": sum(r.tokens_used or 0 for r in successful),
-                        "fastest_model": min(successful, key=lambda x: x.response_time).model_name,
-                        "most_tokens": max(successful, key=lambda x: x.tokens_used or 0).model_name if any(r.tokens_used for r in successful) else "N/A"
-                    }
-                    st.json(stats)
-                    if st.button("✅ Hide Stats", key="hide_stats"):
-                        st.session_state.show_statistics = False
+            # Usage analytics (if budget tracking enabled)
+            if budget_tracker:
+                if st.button("📈 Show Usage Analytics"):
+                    st.session_state.show_analytics = True
+                    st.rerun()
+                
+                if st.session_state.get("show_analytics"):
+                    with st.expander("📊 Usage Analytics", expanded=True):
+                        summary = budget_tracker.get_usage_summary(7)  # Last 7 days
+                        
+                        if summary['total'].get('total_requests', 0) > 0:
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Requests (7d)", summary['total']['total_requests'])
+                            with col2:
+                                st.metric("Total Cost (7d)", f"${summary['total']['total_cost']:.2f}")
+                            with col3:
+                                success_rate = summary['total']['successful_requests'] / summary['total']['total_requests'] * 100
+                                st.metric("Success Rate", f"{success_rate:.1f}%")
+                            
+                            # Cost breakdown by provider
+                            if summary['by_provider']:
+                                st.write("**Cost by Provider (7d):**")
+                                for provider, stats in summary['by_provider'].items():
+                                    st.write(f"• **{provider.title()}**: ${stats['cost']:.2f} ({stats['requests']} requests)")
+                        else:
+                            st.info("No usage data available for the last 7 days.")
+                    
+                    if st.button("✅ Hide Analytics"):
+                        st.session_state.show_analytics = False
                         st.rerun()
-        
-        # Clear results button
-        if st.button("🗑️ Clear Results", help="Clear current results to start fresh"):
-            # Clear all result-related session state
-            st.session_state.last_responses = None
-            st.session_state.last_prompt = ""
-            st.session_state.show_all_text = False
-            st.session_state.show_statistics = False
-            # Clear any copy-related states
-            for key in list(st.session_state.keys()):
-                if key.startswith('copied_text_') or key.startswith('show_copy_'):
-                    del st.session_state[key]
-            st.rerun()
     
-    # Footer (keeping existing)
+    # =========================================================================
+    # 7. ENHANCED FOOTER WITH BUDGET INFO
+    # =========================================================================
+    
     st.markdown("---")
     footer_col1, footer_col2, footer_col3 = st.columns(3)
     
     with footer_col1:
-        if remember_keys:
-            st.markdown("🔄 **Session**: Keys & results until refresh")
+        if st.session_state.remember_keys:
+            st.markdown("🔄 **Session**: Keys & results preserved")
         else:
             st.markdown("🔒 **Security**: Keys cleared after each action")
+    
     with footer_col2:
-        st.markdown("💰 **Cost**: Model discovery free, retries cost credits")
-    with footer_col3:
-        if any(env_keys.values()):
-            st.markdown("🔧 **Environment**: Variables loaded")
+        if budget_tracker:
+            daily_usage = budget_tracker.get_daily_usage()
+            st.markdown(f"💰 **Today's Usage**: ${daily_usage:.2f}")
         else:
-            st.markdown("📋 **Copy**: Native Streamlit clipboard support")
+            st.markdown("💡 **Tip**: Enable budget tracking in .env")
     
-    # Environment variable instructions (keeping existing)
-    with st.expander("🔧 Environment Variable Setup"):
-        st.markdown("""
-        **To avoid entering API keys manually, set these environment variables:**
-        
-        ```bash
-        export ANTHROPIC_API_KEY="your_claude_key_here"
-        export OPENAI_API_KEY="your_openai_key_here" 
-        export GOOGLE_API_KEY="your_gemini_key_here"
-        ```
-        
-        **Docker users:**
-        ```bash
-        # Add to your docker run command:
-        docker run -e ANTHROPIC_API_KEY="your_key" \\
-                   -e OPENAI_API_KEY="your_key" \\
-                   -e GOOGLE_API_KEY="your_key" \\
-                   multi-model-ai-comparison
-        ```
-        
-        **Dynamic Model Discovery:**
-        - 🔄 **Dynamic**: Models fetched from API (latest available)
-        - 📋 **Static**: Fallback list if API unavailable  
-        - 🆓 **Free**: Model discovery doesn't cost tokens
-        - ⚡ **Cached**: Results cached for 5 minutes
-        
-        **Retry & Copy Features:**
-        - 🔄 **Retry**: Failed requests can be retried with different models
-        - 📋 **Copy**: Native text areas for reliable copying (Ctrl+A, Ctrl+C)
-        - 🎯 **In-place updates**: Retries update results without re-running all models
-        - 🔧 **Model switching**: Change model during retry
-        - ✅ **Visual feedback**: Clear copy and selection indicators
-        
-        **Note**: Environment variables are loaded on startup and can be overridden manually in the UI.
-        """)
+    with footer_col3:
+        model_count = len([k for k, v in current_api_keys.items() if v])
+        st.markdown(f"🎯 **Models**: {model_count} configured")
+
+# Enhanced display functions with copy functionality
+def display_side_by_side_enhanced(responses: List[ModelResponse]):
+    """Enhanced side-by-side display with working copy buttons"""
+    cols = st.columns(len(responses))
     
-    # Enhanced debug section
-    with st.expander("🔧 Debug & Troubleshooting"):
-        st.markdown("""
-        **Enhanced Gemini Debugging:**
+    for i, response in enumerate(responses):
+        with cols[i]:
+            if response.error:
+                if "Gemini" in response.model_name and response.detailed_error:
+                    display_detailed_error(response)
+                else:
+                    st.error(f"**{response.model_name}** - Error: {response.error}")
+            else:
+                # Success header
+                st.success(f"**{response.model_name}** ({response.response_time:.2f}s)")
+                
+                # Enhanced copy section
+                create_copy_section(
+                    text=response.response,
+                    title="📝 Response",
+                    key=f"response_{i}",
+                    show_download=True
+                )
+                
+                # Metrics
+                if response.tokens_used:
+                    st.caption(f"Tokens: {response.tokens_used}")
+
+def display_sequential_enhanced(responses: List[ModelResponse]):
+    """Enhanced sequential display with working copy buttons"""
+    for i, response in enumerate(responses):
+        st.subheader(f"{response.model_name}")
         
-        The app now includes enhanced error reporting for Gemini API issues:
-        - ✅ **API Key Validation**: Checks key format before making requests
-        - 🔍 **Detailed Error Messages**: Specific troubleshooting tips for each error type
-        - 📋 **Request/Response Logging**: Full request details logged for debugging
-        - 🛠️ **Debug Panel**: Test API keys and diagnose issues in the sidebar
+        if response.error:
+            if "Gemini" in response.model_name and response.detailed_error:
+                display_detailed_error(response)
+            else:
+                st.error(f"Error: {response.error}")
+        else:
+            # Metrics row
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Response Time", f"{response.response_time:.2f}s")
+            with col2:
+                st.metric("Tokens", response.tokens_used or "N/A")
+            with col3:
+                # Copy button
+                create_copy_button(
+                    text=response.response,
+                    button_text="📋 Copy Response",
+                    key=f"seq_copy_{i}"
+                )
+            
+            # Enhanced response display
+            create_copy_section(
+                text=response.response,
+                title="Response Content",
+                key=f"seq_response_{i}",
+                show_download=True
+            )
         
-        **Common Gemini Issues & Solutions:**
-        
-        **API Key Problems:**
-        - `validation failed`: Key format invalid or wrong service key
-        - `401 Unauthorized`: Invalid or expired API key
-        - Solution: Get fresh key from https://aistudio.google.com/app/apikey
-        
-        **Model Availability:**
-        - `404 Not Found`: Model doesn't exist or not available in your region
-        - `403 Forbidden`: Model access restricted or quota exceeded
-        - Solution: Try different model (gemini-1.5-pro vs gemini-1.5-flash)
-        
-        **Response Structure Issues:**
-        - `json_parse`: Invalid JSON response (server error)
-        - `response_structure`: Unexpected API response format
-        - Solution: Check logs for raw response, try again later
-        
-        **Testing Commands:**
-        ```bash
-        # Test your Gemini API key
-        curl "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
-        
-        # Test simple generation
-        curl -X POST \\
-          "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=YOUR_KEY" \\
-          -H "Content-Type: application/json" \\
-          -d '{"contents": [{"parts": [{"text": "Hello"}]}]}'
-        ```
-        
-        **Debug Logs:**
-        - Check container logs: `make logs` or `docker logs container_name`
-        - Look for "🚀 Gemini API Request" and "📥 Gemini API Response" entries
-        - Full request/response details are logged for troubleshooting
-        
-        **Getting Help:**
-        - Use the Gemini Debug Panel in the sidebar to test your API key
-        - Check the detailed error information in failed responses
-        - Review troubleshooting tips provided for each error type
-        """)
+        st.divider()
+
+def display_detailed_analysis_enhanced(responses: List[ModelResponse]):
+    """Enhanced detailed analysis with working copy buttons"""
+    # Summary metrics
+    st.subheader("📊 Comparison Summary")
+    
+    successful_responses = [r for r in responses if not r.error]
+    if successful_responses:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            avg_time = sum(r.response_time for r in successful_responses) / len(successful_responses)
+            st.metric("Avg Response Time", f"{avg_time:.2f}s")
+        with col2:
+            total_tokens = sum(r.tokens_used or 0 for r in successful_responses)
+            st.metric("Total Tokens", total_tokens)
+        with col3:
+            success_rate = len(successful_responses) / len(responses) * 100
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+        with col4:
+            # Estimated total cost if budget tracking is available
+            if 'budget_tracker' in st.session_state and st.session_state.budget_tracker:
+                # Calculate estimated cost for all responses
+                st.metric("Est. Total Cost", "$0.XX")  # Would need proper calculation
+    
+    # Individual responses with enhanced copy
+    st.subheader("📝 Individual Responses")
+    
+    for i, response in enumerate(responses):
+        with st.expander(f"{response.model_name} - {'✅' if not response.error else '❌'}", expanded=True):
+            if response.error:
+                if "Gemini" in response.model_name and response.detailed_error:
+                    display_detailed_error(response)
+                else:
+                    st.error(f"Error: {response.error}")
+            else:
+                # Enhanced metrics and copy options
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.caption(f"Time: {response.response_time:.2f}s | Tokens: {response.tokens_used or 'N/A'}")
+                with col2:
+                    create_copy_button(
+                        text=response.response,
+                        button_text="📋 Copy",
+                        key=f"detail_copy_{i}"
+                    )
+                
+                # Response with enhanced copy functionality
+                create_copy_section(
+                    text=response.response,
+                    title="Response Content", 
+                    key=f"detail_response_{i}",
+                    show_download=True
+                )
 
 if __name__ == "__main__":
     main()

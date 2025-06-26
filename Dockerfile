@@ -23,7 +23,7 @@ RUN pip install --upgrade pip && \
     pip install streamlit>=1.28.0 aiohttp>=3.8.0 asyncio-throttle>=1.0.2 python-dotenv>=1.0.0 pydantic>=2.0.0 httpx>=0.25.0
 
 # Copy application code
-COPY app.py ./
+COPY . .
 
 # Create a non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
